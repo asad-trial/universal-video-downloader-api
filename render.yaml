@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: universal-video-downloader-api
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: MAX_DOWNLOAD_MB
+        value: "1024"
+      - key: REQUEST_TIMEOUT
+        value: "60"
+      - key: MAX_FORMATS
+        value: "40"
+      - key: MAX_CONCURRENT_DOWNLOADS
+        value: "2"
