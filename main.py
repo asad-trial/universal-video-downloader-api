@@ -223,8 +223,9 @@ def ytdlp_base_options() -> dict:
     - EJS scripts fetched from yt-dlp's GitHub when needed
     """
     return {
-        "quiet": True,
-        "no_warnings": True,
+      "quiet": False,
+"no_warnings": False,
+"verbose": True,
         "noplaylist": True,
         "skip_download": True,
         "socket_timeout": REQUEST_TIMEOUT,
