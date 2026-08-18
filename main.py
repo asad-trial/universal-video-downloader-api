@@ -233,7 +233,7 @@ def ytdlp_base_options() -> dict:
         "restrictfilenames": True,
         "extractor_args": {
             "youtube": {
-                "player_client": ["mweb"],
+    "player_client": ["android_vr"],
             },
             "youtubepot-bgutilhttp": {
     "base_url": [os.getenv("BGUTIL_POT_URL")]
