@@ -11,8 +11,8 @@ import yt_dlp
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from starlette.background import BackgroundTask
 from pydantic import BaseModel, field_validator
+from starlette.background import BackgroundTask
 
 
 APP_NAME = "Universal Video Downloader API"
@@ -20,17 +20,25 @@ ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
         "ALLOWED_ORIGINS",
-        "https://your-blog.blogspot.com"
+        "https://viralzonei.blogspot.com",
     ).split(",")
     if origin.strip()
 ]
+
 MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "1024"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))
 MAX_FORMATS = int(os.getenv("MAX_FORMATS", "40"))
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
+
+# Built in the Docker image from bgutil-ytdlp-pot-provider 1.3.1.
+BGUTIL_SCRIPT_PATH = os.getenv(
+    "BGUTIL_SCRIPT_PATH",
+    "/opt/bgutil-ytdlp-pot-provider/server/build/generate_once.js",
+)
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.0.0",
+    version="1.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -43,9 +51,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-download_semaphore = asyncio.Semaphore(
-    int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
-)
+download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 
 class URLRequest(BaseModel):
@@ -64,7 +70,6 @@ class URLRequest(BaseModel):
 
 
 def is_public_hostname(hostname: str) -> bool:
-    """Basic SSRF protection for the user-supplied URL."""
     try:
         infos = socket.getaddrinfo(hostname, None)
     except socket.gaierror:
@@ -89,25 +94,23 @@ def validate_public_url(url: str) -> None:
     hostname = parsed.hostname
     if not hostname:
         raise HTTPException(status_code=400, detail="Invalid URL.")
-    # Skip hostname validation for obvious IP literals first.
+
     try:
         ip = ipaddress.ip_address(hostname)
-        if not (
-            ip.is_global
-            and not ip.is_private
-            and not ip.is_loopback
-            and not ip.is_link_local
-            and not ip.is_multicast
-            and not ip.is_reserved
-            and not ip.is_unspecified
-        ):
-            raise HTTPException(status_code=400, detail="Private/internal URLs are not allowed.")
+        if not ip.is_global:
+            raise HTTPException(
+                status_code=400,
+                detail="Private/internal URLs are not allowed.",
+            )
         return
     except ValueError:
         pass
 
     if not is_public_hostname(hostname):
-        raise HTTPException(status_code=400, detail="The target host is not publicly reachable.")
+        raise HTTPException(
+            status_code=400,
+            detail="The target host is not publicly reachable.",
+        )
 
 
 def extractor_name(info: dict) -> str:
@@ -157,7 +160,6 @@ def collect_formats(info: dict) -> list[dict]:
     output = []
     seen = set()
 
-    # Include formats that can be meaningfully selected by a web UI.
     for fmt in info.get("formats") or []:
         vcodec = fmt.get("vcodec")
         acodec = fmt.get("acodec")
@@ -172,7 +174,7 @@ def collect_formats(info: dict) -> list[dict]:
         if not quality:
             continue
 
-        # De-duplicate near-identical entries.
+        # De-duplicate similar formats.
         key = (
             quality,
             ext,
@@ -194,13 +196,14 @@ def collect_formats(info: dict) -> list[dict]:
                 "has_video": vcodec != "none",
                 "has_audio": acodec != "none",
                 "protocol": fmt.get("protocol"),
-                # Raw media URLs can expire and may require headers.
-                # The frontend should use our /api/download endpoint instead.
-                "direct_url": fmt.get("url") if fmt.get("protocol") in {"http", "https"} else None,
+                "direct_url": (
+                    fmt.get("url")
+                    if fmt.get("protocol") in {"http", "https"}
+                    else None
+                ),
             }
         )
 
-    # Prefer higher quality first, then audio last.
     output.sort(
         key=lambda x: (
             0 if x["has_video"] else 1,
@@ -208,14 +211,18 @@ def collect_formats(info: dict) -> list[dict]:
             x["ext"] or "",
         )
     )
-
     return output[:MAX_FORMATS]
 
 
-def extract_info(url: str) -> dict:
-    validate_public_url(url)
-
-    ydl_opts = {
+def ytdlp_base_options() -> dict:
+    """
+    Current YouTube configuration:
+    - mweb client
+    - bgutil PO-token provider via generation script
+    - Node 22 as JS runtime for YouTube challenge solving
+    - EJS scripts fetched from yt-dlp's GitHub when needed
+    """
+    return {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -223,12 +230,29 @@ def extract_info(url: str) -> dict:
         "socket_timeout": REQUEST_TIMEOUT,
         "retries": 3,
         "fragment_retries": 3,
+        "extractor_retries": 3,
         "geo_bypass": True,
         "restrictfilenames": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["mweb"],
+            },
+            "youtubepot-bgutilscript": {
+                "script_path": [BGUTIL_SCRIPT_PATH],
+            },
+        },
+        "js_runtimes": {
+            "node": {"path": None},
+        },
+        "remote_components": ["ejs:github"],
     }
 
+
+def extract_info(url: str) -> dict:
+    validate_public_url(url)
+
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(ytdlp_base_options()) as ydl:
             return ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -236,7 +260,11 @@ def extract_info(url: str) -> dict:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {exc}")
 
 
-def build_download_format(info: dict, requested_format_id: Optional[str], audio_only: bool) -> tuple[str, bool]:
+def build_download_format(
+    info: dict,
+    requested_format_id: Optional[str],
+    audio_only: bool,
+) -> tuple[str, bool]:
     if audio_only or requested_format_id == "mp3":
         return "bestaudio/best", True
 
@@ -244,17 +272,19 @@ def build_download_format(info: dict, requested_format_id: Optional[str], audio_
 
     if requested_format_id and requested_format_id in available:
         selected = available[requested_format_id]
-        if selected.get("vcodec") != "none" and selected.get("acodec") != "none":
+
+        if (
+            selected.get("vcodec") != "none"
+            and selected.get("acodec") != "none"
+        ):
             return requested_format_id, False
 
-        # Video-only format: pair it with best compatible audio.
         height = selected.get("height") or 720
         return (
             f"{requested_format_id}+bestaudio/best[height<={int(height)}]/best",
             False,
         )
 
-    # Generic fallback. Prefer MP4/H.264-compatible streams where possible.
     return (
         "bestvideo[height<=2160]+bestaudio/"
         "best[height<=2160]/best",
@@ -262,30 +292,34 @@ def build_download_format(info: dict, requested_format_id: Optional[str], audio_
     )
 
 
-def download_media(url: str, requested_format_id: Optional[str], audio_only: bool) -> Path:
+def download_media(
+    url: str,
+    requested_format_id: Optional[str],
+    audio_only: bool,
+) -> Path:
     validate_public_url(url)
     info = extract_info(url)
-    format_selector, is_mp3 = build_download_format(info, requested_format_id, audio_only)
+    format_selector, is_mp3 = build_download_format(
+        info,
+        requested_format_id,
+        audio_only,
+    )
 
     with tempfile.TemporaryDirectory(prefix="uvd-") as tmp:
         tmp_path = Path(tmp)
         output_template = str(tmp_path / "download.%(ext)s")
 
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "format": format_selector,
-            "outtmpl": output_template,
-            "merge_output_format": "mp4",
-            "max_filesize": MAX_DOWNLOAD_MB * 1024 * 1024,
-            "socket_timeout": REQUEST_TIMEOUT,
-            "retries": 3,
-            "fragment_retries": 3,
-            "restrictfilenames": True,
-            "overwrites": True,
-            "postprocessors": [],
-        }
+        ydl_opts = ytdlp_base_options()
+        ydl_opts.update(
+            {
+                "skip_download": False,
+                "format": format_selector,
+                "outtmpl": output_template,
+                "merge_output_format": "mp4",
+                "max_filesize": MAX_DOWNLOAD_MB * 1024 * 1024,
+                "overwrites": True,
+            }
+        )
 
         if is_mp3:
             ydl_opts.update(
@@ -311,26 +345,31 @@ def download_media(url: str, requested_format_id: Optional[str], audio_only: boo
             raise HTTPException(status_code=500, detail=f"Download failed: {exc}")
 
         candidates = [
-            p for p in tmp_path.iterdir()
-            if p.is_file()
-            and not p.name.endswith((".part", ".ytdl"))
+            p
+            for p in tmp_path.iterdir()
+            if p.is_file() and not p.name.endswith((".part", ".ytdl"))
         ]
 
         if not candidates:
-            raise HTTPException(status_code=500, detail="No output file was created.")
+            raise HTTPException(
+                status_code=500,
+                detail="No output file was created.",
+            )
 
         source_file = max(candidates, key=lambda p: p.stat().st_mtime)
 
-        # Copy out of TemporaryDirectory before it is deleted.
         persistent_temp = Path(tempfile.mkstemp(prefix="uvd-output-")[1])
         persistent_temp.unlink(missing_ok=True)
-        persistent_temp.write_bytes(source_file.read_bytes())
+        source_file.replace(persistent_temp)
         return persistent_temp
 
 
 def media_filename(info: dict, path: Path) -> str:
     title = info.get("title") or "download"
-    safe = "".join(ch if ch.isalnum() or ch in " -_()." else "_" for ch in title)
+    safe = "".join(
+        ch if ch.isalnum() or ch in " -_()." else "_"
+        for ch in title
+    )
     safe = safe[:100].strip() or "download"
     return f"{safe}.{path.suffix.lstrip('.')}"
 
@@ -352,7 +391,6 @@ async def health():
 
 @app.get("/api/info")
 async def info_get(url: str = Query(..., min_length=8)):
-    # Extraction is blocking; run it off the event loop.
     info = await asyncio.to_thread(extract_info, url)
 
     formats = collect_formats(info)
@@ -402,23 +440,32 @@ async def download_get(
 ):
     async with download_semaphore:
         output_path = await asyncio.to_thread(
-            download_media, url, format_id, audio_only
+            download_media,
+            url,
+            format_id,
+            audio_only,
         )
 
-    # Extract only the metadata needed for the filename after the file is built.
     info = await asyncio.to_thread(extract_info, url)
     filename = media_filename(info, output_path)
-    media_type = "audio/mpeg" if format_id == "mp3" or audio_only else "video/mp4"
+    media_type = (
+        "audio/mpeg"
+        if format_id == "mp3" or audio_only
+        else "video/mp4"
+    )
 
-    response = FileResponse(
+    return FileResponse(
         output_path,
         media_type=media_type,
         filename=filename,
-        background=BackgroundTask(lambda: output_path.unlink(missing_ok=True)),
+        background=BackgroundTask(
+            lambda: output_path.unlink(missing_ok=True)
+        ),
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    return response
 
 
 @app.post("/api/download")
@@ -431,8 +478,14 @@ async def download_post(payload: URLRequest):
 
 
 @app.exception_handler(Exception)
-async def unhandled_exception_handler(_: Request, exc: Exception):
+async def unhandled_exception_handler(
+    _: Request,
+    exc: Exception,
+):
     return JSONResponse(
         status_code=500,
-        content={"success": False, "error": "Internal server error."},
+        content={
+            "success": False,
+            "error": "Internal server error.",
+        },
     )
