@@ -224,8 +224,8 @@ def ytdlp_base_options() -> dict:
     """
     return {
       "quiet": False,
-"no_warnings": False,
-"verbose": True,
+   "no_warnings": False,
+   "verbose": True,
         "noplaylist": True,
         "skip_download": True,
         "socket_timeout": REQUEST_TIMEOUT,
