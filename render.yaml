@@ -14,4 +14,6 @@ services:
       - key: MAX_FORMATS
         value: "40"
       - key: MAX_CONCURRENT_DOWNLOADS
-        value: "2"
+        value: "1"
+      - key: BGUTIL_SCRIPT_PATH
+        value: "/opt/bgutil-ytdlp-pot-provider/server/build/generate_once.js"
