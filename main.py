@@ -31,10 +31,7 @@ MAX_FORMATS = int(os.getenv("MAX_FORMATS", "40"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
 
 # Built in the Docker image from bgutil-ytdlp-pot-provider 1.3.1.
-BGUTIL_SCRIPT_PATH = os.getenv(
-    "BGUTIL_SCRIPT_PATH",
-    "/opt/bgutil-ytdlp-pot-provider/server/build/generate_once.js",
-)
+
 
 app = FastAPI(
     title=APP_NAME,
@@ -238,8 +235,8 @@ def ytdlp_base_options() -> dict:
             "youtube": {
                 "player_client": ["mweb"],
             },
-            "youtubepot-bgutilscript": {
-                "script_path": [BGUTIL_SCRIPT_PATH],
+            "youtubepot-bgutilhttp": {
+    "base_url": [os.getenv("BGUTIL_POT_URL")]
             },
         },
         "js_runtimes": {
